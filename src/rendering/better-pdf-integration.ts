@@ -1,6 +1,26 @@
 import { App, TFile, MarkdownRenderer, Component } from 'obsidian';
 import { PDFCoordinateExtractor } from './pdf-coordinate-extractor';
 
+// File-based logging to bypass console filtering
+const fs = require('fs').promises;
+const path = require('path');
+let logFilePath: string | null = null;
+
+async function logToFile(message: string) {
+	try {
+		if (!logFilePath) {
+			const pluginDir = (window as any).app.vault.adapter.basePath + '/.obsidian/plugins/new-pdf-anki';
+			logFilePath = path.join(pluginDir, 'debug.log');
+			// Clear log file on first write
+			await fs.writeFile(logFilePath, `=== NEW SESSION ${new Date().toISOString()} ===\n`);
+		}
+		const timestamp = new Date().toISOString();
+		await fs.appendFile(logFilePath, `[${timestamp}] ${message}\n`);
+	} catch (error) {
+		console.error('Failed to write to log file:', error);
+	}
+}
+
 /**
  * EXACT COPY of better-export-pdf plugin's PDF generation workflow
  * DO NOT MODIFY - this is the proven working implementation
@@ -270,6 +290,7 @@ export class BetterPDFIntegration {
 		pdfCoordinates: Array<{left: number; top: number; width: number; height: number; pageNum: number; text?: string}>;
 	}> {
 		console.log('BetterPDFIntegration: Exporting file:', file.path);
+		await logToFile(`========== EXPORT STARTED: ${file.path} ==========`);
 
 		// EXACT better-export-pdf workflow starts here
 		const ws = this.app.workspace;
@@ -285,6 +306,15 @@ export class BetterPDFIntegration {
 		}
 
 		console.log('Got file data, length:', data.length);
+		await logToFile(`Got file data, length: ${data.length}`);
+
+		// DIAGNOSTIC: Check if markdown contains embed syntax
+		const hasEmbedSyntax = data.includes('![[');
+		const embedMatches = data.match(/!\[\[([^\]]+)\]\]/g);
+		await logToFile(`Markdown contains embed syntax (![[): ${hasEmbedSyntax}`);
+		if (embedMatches) {
+			await logToFile(`Found ${embedMatches.length} embed references: ${embedMatches.join(', ')}`);
+		}
 
 		const comp = new Component();
 		comp.load();
@@ -324,6 +354,11 @@ export class BetterPDFIntegration {
 			}
 			viewEl.appendChild(el);
 
+			// DIAGNOSTIC: Check for embeds after initial render
+			let embedCount = viewEl.querySelectorAll('span.markdown-embed').length;
+			let markCount = viewEl.querySelectorAll('mark').length;
+			await logToFile(`After MarkdownRenderer.render(): ${embedCount} embeds, ${markCount} marks`);
+
 			// Post-process (EXACT better-export-pdf)
 			await (MarkdownRenderer as any).postProcess(this.app, {
 				docId: this.generateDocId(16),
@@ -337,7 +372,17 @@ export class BetterPDFIntegration {
 				displayMode: true
 			});
 
+			// DIAGNOSTIC: Check for embeds after postProcess
+			embedCount = viewEl.querySelectorAll('span.markdown-embed').length;
+			markCount = viewEl.querySelectorAll('mark').length;
+			await logToFile(`After postProcess(): ${embedCount} embeds, ${markCount} marks, ${promises.length} promises`);
+
 			await Promise.all(promises);
+
+			// DIAGNOSTIC: Check for embeds after Promise.all
+			embedCount = viewEl.querySelectorAll('span.markdown-embed').length;
+			markCount = viewEl.querySelectorAll('mark').length;
+			await logToFile(`After Promise.all(): ${embedCount} embeds, ${markCount} marks`);
 
 			// Remove internal link hrefs
 			printEl.findAll('a.internal-link').forEach((el: any) => {
@@ -353,35 +398,67 @@ export class BetterPDFIntegration {
 
 			// CRITICAL: Wait for embeds to load (better-export-pdf does this!)
 			console.log('Waiting for embeds to render...');
+			await logToFile('Waiting for embeds to render...');
 			try {
 				await fixWaitRender(data, viewEl);
 				console.log('Embeds rendered');
+				await logToFile('Embeds rendered successfully');
 			} catch (error) {
 				console.warn('Wait timeout:', error);
+				await logToFile(`Wait timeout: ${error}`);
 			}
 
 			// Fix canvas elements
 			fixCanvasToImage(viewEl);
 
+			// DIAGNOSTIC: Check for embeds and marks after fixWaitRender
+			embedCount = viewEl.querySelectorAll('span.markdown-embed').length;
+			markCount = viewEl.querySelectorAll('mark').length;
+			await logToFile(`After fixWaitRender(): ${embedCount} embeds, ${markCount} marks`);
+
+			// DIAGNOSTIC: Check for marks inside embeds specifically
+			const embedElements = viewEl.querySelectorAll('span.markdown-embed');
+			let marksInEmbeds = 0;
+			embedElements.forEach((embed) => {
+				const embedMarks = embed.querySelectorAll('mark');
+				marksInEmbeds += embedMarks.length;
+			});
+			await logToFile(`Marks inside embeds: ${marksInEmbeds} out of ${markCount} total marks`);
+
 			// DIAGNOSTIC: Extract highlighted texts from RENDERED HTML (includes transcluded content)
-			console.log('[DIAGNOSTIC] Extracting highlighted texts from rendered HTML...');
+			await logToFile('About to extract highlights from viewEl');
 			const highlightedTexts: string[] = [];
 			const marks = viewEl.querySelectorAll('mark');
+			await logToFile(`Found ${marks.length} mark elements in viewEl`);
 			marks.forEach((mark: HTMLElement) => {
 				const text = mark.textContent?.trim();
 				if (text && text.length > 0) {
 					highlightedTexts.push(text);
 				}
 			});
-			console.log(`[DIAGNOSTIC] Extracted ${highlightedTexts.length} highlighted texts from rendered HTML`);
+			await logToFile(`Extracted ${highlightedTexts.length} highlighted texts from rendered HTML`);
+			for (let i = 0; i < highlightedTexts.length; i++) {
+				const text = highlightedTexts[i];
+				await logToFile(`  Highlight ${i}: "${text.substring(0, 100)}${text.length > 100 ? '...' : ''}"`);
+			}
 
 			// Initialize PDF coordinate extractor for later use
 			const pdfExtractor = new PDFCoordinateExtractor();
+
+			// DIAGNOSTIC: Check if transclusions are in printEl
+			await logToFile('Checking printEl content before cloning');
+			const embedsInPrintEl = printEl.querySelectorAll('span.markdown-embed');
+			await logToFile(`Found ${embedsInPrintEl.length} markdown-embed elements in printEl`);
+			const marksInPrintEl = printEl.querySelectorAll('mark');
+			await logToFile(`Found ${marksInPrintEl.length} mark elements in printEl`);
+			await logToFile(`printEl HTML length: ${printEl.innerHTML.length} chars`);
+			await logToFile(`printEl text preview (first 500 chars): "${printEl.textContent?.substring(0, 500)}"`);
 
 			// Create HTML document
 			const doc = document.implementation.createHTMLDocument('export');
 			doc.head.innerHTML = document.head.innerHTML;
 			doc.title = file.basename;
+			await logToFile(`Created HTML document, title: ${doc.title}`);
 
 			// Clone printEl and insert title inside markdown-preview-view for theme styling
 			const clonedPrintEl = printEl.cloneNode(true) as HTMLElement;
@@ -401,9 +478,15 @@ export class BetterPDFIntegration {
 			}
 
 			doc.body.appendChild(clonedPrintEl);
+			await logToFile(`Appended cloned printEl to doc.body`);
+			await logToFile(`doc.body HTML length BEFORE encoding: ${doc.body.innerHTML.length} chars`);
+			await logToFile(`doc.body embeds BEFORE encoding: ${doc.body.querySelectorAll('span.markdown-embed').length}`);
 
 			// CRITICAL: Encode embeds for safe transport to webview (better-export-pdf)
 			encodeEmbeds(doc);
+			await logToFile(`Encoded embeds for webview transport`);
+			await logToFile(`doc.body HTML length AFTER encoding: ${doc.body.innerHTML.length} chars`);
+			await logToFile(`doc.body embeds AFTER encoding: ${doc.body.querySelectorAll('span.markdown-embed').length}`);
 
 			// Clean up
 			printEl.detach();
@@ -447,6 +530,7 @@ export class BetterPDFIntegration {
 						try {
 							clearTimeout(timeout);
 							console.log('Webview dom-ready');
+							await logToFile('Webview dom-ready event fired');
 
 							// Inject CSS concurrently with conditional @page margins
 							getAllStyles(pdfMarginType, pdfMarginTop, pdfMarginBottom, pdfMarginLeft, pdfMarginRight).forEach(async (css) => {
@@ -508,9 +592,54 @@ export class BetterPDFIntegration {
 								}
 
 								document.title = \`${doc.title}\`;
+
+								// DEBUG: Log webview content after injection
+								window.__debugInfo = {
+									bodyLength: document.body.innerHTML.length,
+									embedCount: document.querySelectorAll('span.markdown-embed').length,
+									textPreview: document.body.textContent.substring(0, 500)
+								};
 							`);
 
 							console.log('HTML injected');
+
+							// Get debug info from webview
+							const debugInfo = await webview.executeJavaScript('window.__debugInfo');
+							await logToFile(`Webview AFTER injection: bodyLength=${debugInfo.bodyLength}, embeds=${debugInfo.embedCount}`);
+							await logToFile(`Webview text preview: "${debugInfo.textPreview}"`);
+
+							// CRITICAL: Check embed visibility and dimensions
+							const embedDiagnostics = await webview.executeJavaScript(`
+								(() => {
+									const embeds = document.querySelectorAll('span.markdown-embed');
+									const diagnostics = [];
+									embeds.forEach((embed, i) => {
+										const rect = embed.getBoundingClientRect();
+										const computed = window.getComputedStyle(embed);
+										diagnostics.push({
+											index: i,
+											display: computed.display,
+											visibility: computed.visibility,
+											height: computed.height,
+											offsetHeight: embed.offsetHeight,
+											scrollHeight: embed.scrollHeight,
+											rect: {
+												top: rect.top,
+												height: rect.height,
+												bottom: rect.bottom
+											},
+											textPreview: embed.textContent.substring(0, 100)
+										});
+									});
+									return diagnostics;
+								})()
+							`);
+
+							await logToFile(`=== EMBED DIAGNOSTICS (${embedDiagnostics.length} embeds) ===`);
+							for (const diag of embedDiagnostics) {
+								await logToFile(`Embed ${diag.index}: display=${diag.display}, visibility=${diag.visibility}, height=${diag.height}, offsetHeight=${diag.offsetHeight}, rect.top=${diag.rect.top}, rect.height=${diag.rect.height}`);
+								await logToFile(`  Text: "${diag.textPreview}"`);
+							}
 
 							// Inject patch styles AFTER HTML with conditional @page margins
 							getPatchStyle(pdfMarginType, pdfMarginTop, pdfMarginBottom, pdfMarginLeft, pdfMarginRight).forEach(async (css) => {
@@ -627,13 +756,59 @@ export class BetterPDFIntegration {
 								cssMargins: pdfMarginType !== '0' ? 'active' : 'none'
 							});
 
+							// CRITICAL: Scroll to top before printToPDF
+							// This ensures we capture from the very beginning of the document
+							await webview.executeJavaScript(`
+								window.scrollTo(0, 0);
+								document.documentElement.scrollTop = 0;
+								document.body.scrollTop = 0;
+							`);
+							await logToFile(`Scrolled webview to top before PDF generation`);
+
+							// DIAGNOSTIC: Check document state before printToPDF
+							const prePDFDiagnostics = await webview.executeJavaScript(`
+								(() => {
+									const bodyStyle = window.getComputedStyle(document.body);
+									return {
+										bodyScrollHeight: document.body.scrollHeight,
+										bodyOffsetHeight: document.body.offsetHeight,
+										bodyClientHeight: document.body.clientHeight,
+										documentHeight: document.documentElement.scrollHeight,
+										embedCount: document.querySelectorAll('span.markdown-embed').length,
+										firstEmbedTop: document.querySelector('span.markdown-embed')?.getBoundingClientRect().top || null,
+										scrollY: window.scrollY,
+										documentScrollTop: document.documentElement.scrollTop,
+										bodyScrollTop: document.body.scrollTop,
+										bodyPadding: {
+											top: bodyStyle.paddingTop,
+											bottom: bodyStyle.paddingBottom,
+											left: bodyStyle.paddingLeft,
+											right: bodyStyle.paddingRight
+										},
+										bodyMargin: {
+											top: bodyStyle.marginTop,
+											bottom: bodyStyle.marginBottom
+										}
+									};
+								})()
+							`);
+							await logToFile(`=== PRE-PDF DIAGNOSTICS ===`);
+							await logToFile(`Body scrollHeight: ${prePDFDiagnostics.bodyScrollHeight}, offsetHeight: ${prePDFDiagnostics.bodyOffsetHeight}`);
+							await logToFile(`Document height: ${prePDFDiagnostics.documentHeight}, embedCount: ${prePDFDiagnostics.embedCount}`);
+							await logToFile(`First embed top position: ${prePDFDiagnostics.firstEmbedTop}`);
+							await logToFile(`Scroll position: window.scrollY=${prePDFDiagnostics.scrollY}, document.scrollTop=${prePDFDiagnostics.documentScrollTop}, body.scrollTop=${prePDFDiagnostics.bodyScrollTop}`);
+							await logToFile(`Body padding: top=${prePDFDiagnostics.bodyPadding.top}, bottom=${prePDFDiagnostics.bodyPadding.bottom}, left=${prePDFDiagnostics.bodyPadding.left}, right=${prePDFDiagnostics.bodyPadding.right}`);
+							await logToFile(`Body margin: top=${prePDFDiagnostics.bodyMargin.top}, bottom=${prePDFDiagnostics.bodyMargin.bottom}`);
+
 							console.log('Generating PDF...');
+							await logToFile(`Calling printToPDF with options: ${JSON.stringify(printOptions)}`);
 							const pdfData = await webview.printToPDF(printOptions);
 
 							console.log('PDF generated:', {
 								size: pdfData.length,
 								sizeKB: (pdfData.length / 1024).toFixed(1)
 							});
+							await logToFile(`PDF generated: ${pdfData.length} bytes`);
 
 							// DIAGNOSTIC: Verify PDF page count
 							try {
@@ -677,15 +852,19 @@ export class BetterPDFIntegration {
 								pdfCoordinates = [];
 							}
 
-							// Use PDF coordinates (extracted from FINAL PDF after page breaks)
-							// Fallback to webview coordinates only if PDF extraction fails
-							const finalCoordinates = pdfCoordinates.length > 0 ? pdfCoordinates : webviewCoordinates;
+							// Use whichever coordinate source found MORE highlights
+							// PDF extraction can miss highlights in embedded content
+							// Webview extraction is more reliable for finding all highlights
+							const finalCoordinates = (pdfCoordinates.length >= webviewCoordinates.length)
+								? pdfCoordinates
+								: webviewCoordinates;
 
+							console.log(`[COORDINATE SELECTION] Webview: ${webviewCoordinates.length}, PDF: ${pdfCoordinates.length}`);
 							console.log(`[COORDINATE SELECTION] Using ${finalCoordinates === pdfCoordinates ? 'PDF' : 'webview'} coordinates (${finalCoordinates.length} total)`);
 							if (finalCoordinates === pdfCoordinates) {
-								console.log('[COORDINATE SELECTION] ✓ Using PDF coordinates - these reflect final layout after page breaks');
+								console.log('[COORDINATE SELECTION] ✓ Using PDF coordinates - found equal or more highlights than webview');
 							} else {
-								console.warn('[COORDINATE SELECTION] ⚠ Using webview coordinates as fallback - PDF extraction failed');
+								console.warn('[COORDINATE SELECTION] ⚠ Using webview coordinates - PDF missed some highlights (likely in embeds)');
 							}
 
 							resolve({

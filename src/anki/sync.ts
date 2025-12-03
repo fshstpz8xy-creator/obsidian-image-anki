@@ -76,13 +76,13 @@ export class AnkiSyncManager {
 			const modelNames = await this.client.getModelNames();
 			console.log('Available Anki note types:', modelNames);
 
-			// Priority order: Try Sequential Image Occlusion first, then fall back to standard
+			// Priority order: Try standard Image Occlusion first
 			let imageOcclusionModel: string | undefined = modelNames.find(name =>
-				name === 'Sequential Image Occlusion'
+				name === 'Image Occlusion Enhanced' || name === 'Image Occlusion'
 			);
 
 			if (!imageOcclusionModel) {
-				// Fall back to standard Image Occlusion
+				// Fall back to any Image Occlusion variant
 				imageOcclusionModel = modelNames.find(name =>
 					name.includes('Image Occlusion') || name.includes('image-occlusion')
 				);
@@ -90,7 +90,7 @@ export class AnkiSyncManager {
 
 			if (!imageOcclusionModel) {
 				throw new Error(
-					`Image Occlusion note type not found in Anki. Please create "Sequential Image Occlusion" note type. Available types: ${modelNames.join(', ')}`
+					`Image Occlusion note type not found in Anki. Please install the Image Occlusion Enhanced add-on. Available types: ${modelNames.join(', ')}`
 				);
 			}
 
@@ -113,7 +113,37 @@ export class AnkiSyncManager {
 			}
 
 			// Upload image first
-			await this.client.storeMediaFile(imageFilename, imageData);
+			console.log(`Uploading image to Anki: ${imageFilename} (${imageData.length} bytes base64)`);
+
+			// Validate base64 data
+			if (!imageData || imageData.length === 0) {
+				throw new Error('Image data is empty - cannot upload to Anki');
+			}
+			if (!/^[A-Za-z0-9+/=]+$/.test(imageData.substring(0, 100))) {
+				throw new Error('Image data is not valid base64');
+			}
+
+			try {
+				const mediaResult = await this.client.storeMediaFile(imageFilename, imageData);
+				console.log(`✅ Image uploaded successfully. Result:`, mediaResult);
+
+				// Verify the image was actually stored by checking if it exists
+				// AnkiConnect storeMediaFile returns null on success, or throws on failure
+				if (mediaResult === null) {
+					console.log(`✅ storeMediaFile returned null (success)`);
+				} else {
+					console.log(`⚠️ storeMediaFile returned unexpected value:`, mediaResult);
+				}
+			} catch (mediaError) {
+				console.error(`❌ Image upload FAILED:`, mediaError);
+				console.error(`Error details:`, {
+					message: mediaError.message,
+					stack: mediaError.stack,
+					imageFilename,
+					imageDataLength: imageData.length
+				});
+				throw new Error(`Failed to upload image ${imageFilename}: ${mediaError.message}`);
+			}
 
 			// Check if note already exists
 			const existingNoteId = await this.findNoteByFilePath(filePath);
@@ -138,7 +168,10 @@ export class AnkiSyncManager {
 					deckName,
 					modelName: imageOcclusionModel,
 					fields: fields as Record<string, string>,
-					tags
+					tags,
+					options: {
+						allowDuplicate: true  // TEMPORARY: Allow duplicates to bypass duplicate detection
+					}
 				};
 
 				// Debug: Log what we're sending to Anki
@@ -151,6 +184,14 @@ export class AnkiSyncManager {
 					),
 					tags: note.tags
 				});
+
+				// DETAILED: Log full note data for debugging "cannot create note" error
+				console.log('FULL NOTE DATA FOR ANKI:', JSON.stringify({
+					modelName: note.modelName,
+					deckName: note.deckName,
+					fields: note.fields,
+					tags: note.tags
+				}, null, 2));
 
 				const noteId = await this.client.addNote(note);
 
@@ -171,9 +212,8 @@ export class AnkiSyncManager {
 	}
 
 	/**
-	 * Generate occlusion string for Sequential Image Occlusion note type
-	 * ALL occlusions use c1 - sequential reveal is handled by JavaScript in card template
-	 * Uses decimal coordinates (0-1) and fill color
+	 * Generate occlusion string in custom format for Sequential Image Occlusion template
+	 * Uses proportional coordinates (0-1) that the template expects
 	 */
 	generateOcclusionString(
 		coordinates: Array<{ left: number; top: number; width: number; height: number }>,
@@ -184,15 +224,14 @@ export class AnkiSyncManager {
 		}
 
 		const occlusions = coordinates.map((coord, index) => {
-			// ALWAYS use c1 for Sequential Image Occlusion note type
-			// The card template's JavaScript handles sequential reveals
+			// Use c1 for all occlusions - template handles sequential reveal
 			const clozeNum = 1;
-			// Keep as proportional (0-1) - Anki expects decimal format, not percentage
+			// Keep as proportional (0-1) coordinates
 			const left = coord.left.toFixed(4);
 			const top = coord.top.toFixed(4);
 			const width = coord.width.toFixed(4);
 			const height = coord.height.toFixed(4);
-			// Format: decimal coordinates (0-1) + fill color
+			// Custom format that template parses
 			return `{{c${clozeNum}::image-occlusion:rect:left=${left}:top=${top}:width=${width}:height=${height}:fill=#55aaff}}`;
 		});
 
@@ -281,11 +320,10 @@ export class AnkiSyncManager {
 
 				// Build fields
 				const fields: ImageOcclusionFields = {
-					Image: `<img src="${imageFilename}">`,  // HTML img tag for Anki media display
-					Occlusion: occlusionString,
+					Image: `<img src="${imageFilename}">`,  // HTML img tag for template
+					Occlusions: occlusionString,
 					Header: header,
-					'Back Extra': `File: ${file.basename}\nPage: ${page.pageNum} of ${pages.length}\nHighlights: ${page.coordinates.length}\nCreated: ${new Date().toISOString()}`,
-					Comments: ''
+					'Back Extra': `File: ${file.basename}\nPage: ${page.pageNum} of ${pages.length}\nHighlights: ${page.coordinates.length}\nCreated: ${new Date().toISOString()}`
 				};
 
 				const highlightCount = page.coordinates.length > 0 ? page.coordinates.length : 0;

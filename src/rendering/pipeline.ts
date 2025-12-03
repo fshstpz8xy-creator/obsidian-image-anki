@@ -10,6 +10,24 @@ import { CoordinateMapper } from './coordinate-mapper';
 import { ProcessedDocument, HighlightCoordinate, PageData } from '../anki/models';
 import { generateContentHash } from '../utils/hash';
 
+// File-based logging
+const fs = require('fs').promises;
+const path = require('path');
+let pipelineLogPath: string | null = null;
+
+async function logToFile(message: string) {
+	try {
+		if (!pipelineLogPath) {
+			const pluginDir = (window as any).app.vault.adapter.basePath + '/.obsidian/plugins/new-pdf-anki';
+			pipelineLogPath = path.join(pluginDir, 'debug.log');
+		}
+		const timestamp = new Date().toISOString();
+		await fs.appendFile(pipelineLogPath, `[${timestamp}] ${message}\n`);
+	} catch (error) {
+		console.error('Failed to write to pipeline log:', error);
+	}
+}
+
 /**
  * Orchestrate the complete rendering pipeline
  */
@@ -178,8 +196,28 @@ export class RenderingPipeline {
 
 			// Step 5: Convert PDF to PNG pages
 			console.log('Converting PDF pages to PNG...');
-			const pageImages = await this.pdfToPNGConverter.convertPDFToPages(exportResult.pdfData);
-			console.log(`Converted ${pageImages.length} PDF pages to PNG`);
+			await logToFile('=== STEP 5: Converting PDF to PNG pages ===');
+			console.log(`PDF data size: ${exportResult.pdfData.length} bytes`);
+			await logToFile(`PDF data size: ${exportResult.pdfData.length} bytes`);
+
+			let pageImages;
+			try {
+				await logToFile('Calling PDFToPNGConverter.convertPDFToPages()...');
+				pageImages = await this.pdfToPNGConverter.convertPDFToPages(exportResult.pdfData);
+				console.log(`✅ Converted ${pageImages.length} PDF pages to PNG`);
+				await logToFile(`✅ Converted ${pageImages.length} PDF pages to PNG`);
+
+				if (pageImages.length === 0) {
+					await logToFile('ERROR: PDF-to-PNG conversion returned 0 pages');
+					throw new Error('PDF-to-PNG conversion returned 0 pages - conversion failed');
+				}
+			} catch (pngError) {
+				console.error('❌ PDF-to-PNG conversion failed:', pngError);
+				console.error('Error stack:', pngError.stack);
+				await logToFile(`❌ PDF-to-PNG conversion FAILED: ${pngError.message}`);
+				await logToFile(`Error stack: ${pngError.stack}`);
+				throw new Error(`Failed to convert PDF to PNG pages: ${pngError.message}`);
+			}
 
 			// Step 6: Map coordinates to pages
 			console.log('Mapping coordinates to pages...');
@@ -218,6 +256,12 @@ export class RenderingPipeline {
 			});
 
 			console.log(`Created ${pages.length} pages with coordinates`);
+			console.log('Page details:', pages.map(p => ({
+				pageNum: p.pageNum,
+				coordinateCount: p.coordinates.length,
+				pngDataSize: p.pngData.length,
+				dimensions: { width: p.width, height: p.height }
+			})));
 
 			// Step 7: Validate coordinates
 			const valid = this.coordinateExtractor.validateCoordinates(proportionalCoords);
