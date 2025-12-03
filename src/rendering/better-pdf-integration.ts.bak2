@@ -1,0 +1,608 @@
+import { App, TFile, MarkdownRenderer, Component } from 'obsidian';
+
+/**
+ * EXACT COPY of better-export-pdf plugin's PDF generation workflow
+ * DO NOT MODIFY - this is the proven working implementation
+ */
+
+const CSS_PATCH = `
+/* ---------- css patch ---------- */
+
+body {
+  overflow: auto !important;
+  /* CRITICAL: Match PDF dimensions exactly to prevent coordinate compression */
+  width: 794px !important;     /* A4 width at 96 DPI */
+  max-width: 794px !important;
+  padding: 0 !important;       /* No padding - ensures scrollWidth = 794px */
+  margin: 0 auto !important;   /* Center the content */
+  box-sizing: border-box !important; /* Include any borders in width */
+}
+
+/* Pagination rules to prevent content cut-off */
+@page {
+  size: A4;
+  margin: 0;  /* No margins - ensures coordinates align with PDF content area */
+}
+
+@media print {
+  .print .markdown-preview-view {
+    height: auto !important;
+  }
+  .md-print-anchor, .blockid {
+    white-space: pre !important;
+    border-left: none !important;
+    border-right: none !important;
+    border-top: none !important;
+    border-bottom: none !important;
+    display: inline-block !important;
+    position: absolute !important;
+    width: 1px !important;
+    height: 1px !important;
+    right: 0 !important;
+    outline: 0 !important;
+    background: 0 0 !important;
+    text-decoration: initial !important;
+    text-shadow: initial !important;
+  }
+
+  /* Prevent content cut-off at page boundaries */
+  p, ul, ol, div, h1, h2, h3, h4, h5, h6 {
+    page-break-inside: avoid;
+    orphans: 3;
+    widows: 3;
+  }
+
+  /* Allow natural page breaks between elements */
+  h1, h2, h3 {
+    page-break-after: avoid;
+  }
+}
+
+@media print {
+  table {
+    break-inside: auto;
+  }
+  tr {
+    break-inside: avoid;
+    break-after: auto;
+  }
+}
+
+img.__canvas__ {
+  width: 100% !important;
+  height: 100% !important;
+}
+`;
+
+/**
+ * Extract @media print rules and unwrap them
+ * EXACT COPY from better-export-pdf
+ */
+function getPrintStyle(): string[] {
+	const cssTexts: string[] = [];
+	Array.from(document.styleSheets).forEach((sheet) => {
+		try {
+			const cssRules = sheet?.cssRules ?? [];
+			Array.from(cssRules).forEach((rule) => {
+				if (rule.constructor.name === 'CSSMediaRule') {
+					const mediaRule = rule as CSSMediaRule;
+					if (mediaRule.conditionText === 'print') {
+						const res = mediaRule.cssText.replace(/@media print\s*\{([\s\S]+)\}/gm, '$1');
+						cssTexts.push(res);
+					}
+				}
+			});
+		} catch (error) {
+			console.error(error);
+		}
+	});
+	return cssTexts;
+}
+
+/**
+ * Get patch styles (CSS_PATCH + print styles)
+ * EXACT COPY from better-export-pdf
+ */
+function getPatchStyle(): string[] {
+	return [CSS_PATCH, ...getPrintStyle()];
+}
+
+/**
+ * Collect all CSS from document stylesheets
+ * EXACT COPY from better-export-pdf
+ */
+function getAllStyles(): string[] {
+	const cssTexts: string[] = [];
+
+	Array.from(document.styleSheets).forEach((sheet) => {
+		const id = (sheet.ownerNode as any)?.id;
+
+		// Skip svelte styles
+		if (id?.startsWith('svelte-')) {
+			return;
+		}
+
+		const href = (sheet.ownerNode as any)?.href;
+		const division = `/* ----------${id ? `id:${id}` : href ? `href:${href}` : ''}---------- */`;
+		cssTexts.push(division);
+
+		try {
+			Array.from(sheet?.cssRules ?? []).forEach((rule) => {
+				cssTexts.push(rule.cssText);
+			});
+		} catch (error) {
+			console.error(error);
+		}
+	});
+
+	cssTexts.push(...getPatchStyle());
+	return cssTexts;
+}
+
+/**
+ * Create webview element
+ * EXACT COPY from better-export-pdf
+ */
+function createWebview(scale: number = 1.25): HTMLElement {
+	const webview = document.createElement('webview') as any;
+	webview.src = `app://obsidian.md/help.html`;
+	webview.setAttribute(
+		'style',
+		`height:calc(${scale} * 100%);
+     width: calc(${scale} * 100%);
+     transform: scale(${1 / scale}, ${1 / scale});
+     transform-origin: top left;
+     border: 1px solid #f2f2f2;
+    `
+	);
+	webview.nodeintegration = true;
+	return webview;
+}
+
+/**
+ * Wait for embeds/dataview to render
+ * EXACT COPY from better-export-pdf
+ */
+async function fixWaitRender(data: string, viewEl: HTMLElement): Promise<void> {
+	// Wait 2 seconds if file contains embeds, dataview, or events
+	if (data.includes('```dataview') || data.includes('```gEvent') || data.includes('![[')) {
+		await new Promise(resolve => setTimeout(resolve, 2000));
+	}
+	// Additional wait for DOM changes
+	await new Promise(resolve => setTimeout(resolve, 1000));
+}
+
+/**
+ * Convert canvas elements to images
+ * EXACT COPY from better-export-pdf
+ */
+function fixCanvasToImage(el: HTMLElement): void {
+	const canvases = Array.from(el.querySelectorAll('canvas'));
+	for (const canvas of canvases) {
+		const data = (canvas as HTMLCanvasElement).toDataURL();
+		const img = document.createElement('img');
+		img.src = data;
+		// Copy attributes
+		Array.from(canvas.attributes).forEach(attr => {
+			img.setAttribute(attr.name, attr.value);
+		});
+		img.className = '__canvas__';
+		canvas.replaceWith(img);
+	}
+}
+
+/**
+ * Encode embed contents for safe transport to webview
+ * EXACT COPY from better-export-pdf
+ */
+function encodeEmbeds(doc: Document): void {
+	const spans = Array.from(doc.querySelectorAll('span.markdown-embed')).reverse();
+	spans.forEach((span: HTMLElement) => {
+		span.innerHTML = encodeURIComponent(span.innerHTML);
+	});
+}
+
+export class BetterPDFIntegration {
+	constructor(private app: App) {}
+
+	/**
+	 * Export file to PDF only (no PNG capture)
+	 * Based on better-export-pdf workflow
+	 * Returns PDF data AND coordinates extracted from final rendering
+	 */
+	async exportFileToPDF(
+		file: TFile,
+		offsetX: number = 0,
+		offsetY: number = 0
+	): Promise<{
+		pdfData: Buffer;
+		pdfWidth: number;
+		pdfHeight: number;
+		coordinates: Array<{left: number; top: number; width: number; height: number}>;
+	}> {
+		console.log('BetterPDFIntegration: Exporting file:', file.path);
+
+		// EXACT better-export-pdf workflow starts here
+		const ws = this.app.workspace;
+		const leaf = ws.getLeaf(true);
+		await leaf.openFile(file);
+		const view = leaf.view as any;
+
+		// Get data from view with fallback
+		const data = view?.data ?? (await this.app.vault.read(file));
+
+		if (!data) {
+			throw new Error('File data is empty');
+		}
+
+		console.log('Got file data, length:', data.length);
+
+		const comp = new Component();
+		comp.load();
+
+		// Create printEl directly in body (NOT off-screen)
+		const printEl = document.body.createDiv('print');
+		const viewEl = printEl.createDiv({
+			cls: 'markdown-preview-view markdown-rendered'
+		});
+
+		try {
+			// Fragment capture pattern (EXACT better-export-pdf)
+			const fragment: any = {
+				children: undefined,
+				appendChild(e: any) {
+					this.children = e?.children;
+					throw new Error('exit');
+				}
+			};
+
+			const promises: Promise<any>[] = [];
+
+			try {
+				await MarkdownRenderer.render(this.app, data, fragment, file.path, comp);
+			} catch (error) {
+				// Expected - fragment throws after capturing children
+			}
+
+			// Append captured children using Obsidian API
+			const el = document.createDocumentFragment();
+			if (fragment.children) {
+				Array.from(fragment.children).forEach((item: any) => {
+					const div = document.createElement('div');
+					div.appendChild(item);
+					el.appendChild(div);
+				});
+			}
+			viewEl.appendChild(el);
+
+			// Post-process (EXACT better-export-pdf)
+			await (MarkdownRenderer as any).postProcess(this.app, {
+				docId: this.generateDocId(16),
+				sourcePath: file.path,
+				frontmatter: {},
+				promises,
+				addChild: (e: any) => comp.addChild(e),
+				getSectionInfo: () => null,
+				containerEl: viewEl,
+				el: viewEl,
+				displayMode: true
+			});
+
+			await Promise.all(promises);
+
+			// Remove internal link hrefs
+			printEl.findAll('a.internal-link').forEach((el: any) => {
+				const href = el.dataset.href;
+				if (href) {
+					const [title, anchor] = href.split('#');
+					if ((!title || title.length === 0 || title === file.basename) && anchor?.startsWith('^')) {
+						return;
+					}
+				}
+				el.removeAttribute('href');
+			});
+
+			// CRITICAL: Wait for embeds to load (better-export-pdf does this!)
+			console.log('Waiting for embeds to render...');
+			try {
+				await fixWaitRender(data, viewEl);
+				console.log('Embeds rendered');
+			} catch (error) {
+				console.warn('Wait timeout:', error);
+			}
+
+			// Fix canvas elements
+			fixCanvasToImage(viewEl);
+
+			// Create HTML document
+			const doc = document.implementation.createHTMLDocument('export');
+			doc.head.innerHTML = document.head.innerHTML;
+			doc.title = file.basename;
+
+			// Clone printEl and insert title inside markdown-preview-view for theme styling
+			const clonedPrintEl = printEl.cloneNode(true) as HTMLElement;
+
+			// Find markdown-preview-view div inside cloned printEl
+			const markdownView = clonedPrintEl.querySelector('.markdown-preview-view');
+
+			if (markdownView) {
+				// Create title with minimal styling - let theme handle colors/borders
+				const titleEl = doc.createElement('h1');
+				titleEl.textContent = file.basename;
+				// Only force visibility, let theme CSS handle all visual styling
+				titleEl.style.cssText = 'display: block !important; visibility: visible !important;';
+
+				// Insert as first child of markdown-preview-view to get theme styling
+				markdownView.insertBefore(titleEl, markdownView.firstChild);
+			}
+
+			doc.body.appendChild(clonedPrintEl);
+
+			// CRITICAL: Encode embeds for safe transport to webview (better-export-pdf)
+			encodeEmbeds(doc);
+
+			// Clean up
+			printEl.detach();
+			comp.unload();
+			printEl.remove();
+			leaf.detach();
+
+			console.log('Document created:', {
+				headLength: doc.head.innerHTML.length,
+				bodyLength: doc.body.innerHTML.length
+			});
+
+			// Now inject into webview for PDF/PNG generation
+			const webview = createWebview(1.25) as any;
+
+			const webviewContainer = document.body.createDiv();
+			webviewContainer.style.position = 'fixed';
+			webviewContainer.style.top = '0';
+			webviewContainer.style.left = '0';
+			webviewContainer.style.width = '800px';
+			webviewContainer.style.height = '600px';
+			webviewContainer.style.zIndex = '9999';
+			webviewContainer.style.opacity = '0.1';
+			webviewContainer.style.pointerEvents = 'none';
+			webviewContainer.appendChild(webview);
+
+			try {
+				const result = await new Promise<{
+					pdfData: Buffer;
+					pdfWidth: number;
+					pdfHeight: number;
+					coordinates: Array<{left: number; top: number; width: number; height: number}>;
+				}>((resolve, reject) => {
+					const timeout = setTimeout(() => {
+						reject(new Error('Webview initialization timeout'));
+					}, 10000);
+
+					webview.addEventListener('dom-ready', async () => {
+						try {
+							clearTimeout(timeout);
+							console.log('Webview dom-ready');
+
+							// Inject CSS concurrently (EXACT better-export-pdf method)
+							getAllStyles().forEach(async (css) => {
+								await webview.insertCSS(css);
+							});
+							console.log('CSS injection started (concurrent)');
+
+							// Load custom CSS snippets from .obsidian/snippets/ (only enabled ones)
+							const fs = require('fs').promises;
+							const path = require('path');
+							const basePath = (this.app.vault.adapter as any).basePath;
+							const snippetsDir = basePath + '/.obsidian/snippets';
+
+							try {
+								// Read enabled snippets from appearance.json
+								const appearancePath = basePath + '/.obsidian/appearance.json';
+								const appearanceData = JSON.parse(await fs.readFile(appearancePath, 'utf8'));
+								const enabledSnippets = appearanceData.enabledCssSnippets || [];
+
+								console.log(`Loading ${enabledSnippets.length} enabled CSS snippets`);
+
+								// Only load enabled snippets
+								for (const snippetName of enabledSnippets) {
+									const cssPath = path.join(snippetsDir, snippetName + '.css');
+									try {
+										const cssContent = await fs.readFile(cssPath, 'utf8');
+										await webview.insertCSS(cssContent);
+										console.log(`Loaded enabled snippet: ${snippetName}`);
+									} catch (error) {
+										console.warn(`Could not load snippet ${snippetName}:`, error);
+									}
+								}
+							} catch (error) {
+								console.warn('Could not load CSS snippets:', error);
+							}
+
+							// Inject HTML (EXACT better-export-pdf method)
+							await webview.executeJavaScript(`
+								document.body.innerHTML = decodeURIComponent(\`${encodeURIComponent(doc.body.innerHTML)}\`);
+								document.head.innerHTML = decodeURIComponent(\`${encodeURIComponent(document.head.innerHTML)}\`);
+
+								// CRITICAL: Recursively decode embedded content (better-export-pdf)
+								function decodeAndReplaceEmbed(element) {
+									element.innerHTML = decodeURIComponent(element.innerHTML);
+									const newEmbeds = element.querySelectorAll("span.markdown-embed");
+									newEmbeds.forEach(decodeAndReplaceEmbed);
+								}
+								document.querySelectorAll("span.markdown-embed").forEach(decodeAndReplaceEmbed);
+
+								document.body.setAttribute("class", \`${document.body.getAttribute("class")}\`);
+								document.body.setAttribute("style", \`${document.body.getAttribute("style")}\`);
+
+								if (document.body.addClass) {
+									document.body.addClass("theme-light");
+									document.body.removeClass("theme-dark");
+								} else {
+									document.body.classList.add("theme-light");
+									document.body.classList.remove("theme-dark");
+								}
+
+								document.title = \`${doc.title}\`;
+							`);
+
+							console.log('HTML injected');
+
+							// Inject patch styles AFTER HTML (better-export-pdf timing)
+							getPatchStyle().forEach(async (css) => {
+								await webview.insertCSS(css);
+							});
+							console.log('Patch styles injected');
+
+							// CRITICAL: Extract coordinates from webview AFTER all rendering is complete
+							// This ensures coordinates match the exact HTML that becomes the PDF
+							console.log('Extracting coordinates from webview...');
+							const coordinates = await webview.executeJavaScript(`
+								(() => {
+									const marks = document.querySelectorAll('mark');
+									const container = document.body;
+									const coords = [];
+
+									marks.forEach(mark => {
+										const rects = mark.getClientRects();
+										for (let i = 0; i < rects.length; i++) {
+											const rect = rects[i];
+											// Use FIXED PDF page dimensions (794x1123) for multi-page proportional coordinates
+											coords.push({
+												left: (rect.left + 0) / 794,
+												top: (rect.top + 0) / 1123,
+												width: rect.width / 794,
+												height: rect.height / 1123
+											});
+										}
+									});
+
+									console.log('Webview extracted ' + coords.length + ' coordinates');
+									return coords;
+								})()
+							`);
+
+							console.log(`Extracted ${coordinates.length} coordinates from webview rendering`);
+
+							// Wait for layout (scale with content size for longer documents)
+							const baseWait = 2000;
+							const contentLength = doc.body.innerHTML.length;
+							const extraWait = Math.min(3000, Math.floor(contentLength / 10000) * 500);
+							const totalLayoutWait = baseWait + extraWait;
+							console.log(`Waiting ${totalLayoutWait}ms for layout (content: ${contentLength} chars)`);
+							await new Promise(r => setTimeout(r, totalLayoutWait));
+
+							// Verify content
+							const bodyLength = await webview.executeJavaScript('document.body.innerHTML.length');
+							const bodyHeight = await webview.executeJavaScript('document.body.scrollHeight');
+
+							console.log('Webview content verified:', {
+								bodyLength,
+								bodyHeight,
+								expectedLength: doc.body.innerHTML.length
+							});
+
+							if (bodyLength < 100) {
+								throw new Error(`Webview content failed (bodyLength: ${bodyLength})`);
+							}
+
+							// Wait for paint
+							await new Promise(r => setTimeout(r, 1500));
+
+							// Generate PDF FIRST
+							const printOptions = {
+								pageSize: 'A4' as const,
+								landscape: false,
+								printBackground: true,
+								margins: {
+									marginType: 'custom' as const,
+									top: 0,     // No margins - ensures PDF dimensions match HTML
+									bottom: 0,
+									left: 0,
+									right: 0
+								}
+							};
+
+							console.log('Generating PDF...');
+							const pdfData = await webview.printToPDF(printOptions);
+
+							console.log('PDF generated:', {
+								size: pdfData.length,
+								sizeKB: (pdfData.length / 1024).toFixed(1)
+							});
+
+							// DIAGNOSTIC: Verify PDF page count
+							try {
+								const { PDFDocument } = require('pdf-lib');
+								const verifyPDF = await PDFDocument.load(pdfData);
+								const pageCount = verifyPDF.getPageCount();
+								console.log(`PDF Verification: Generated PDF has ${pageCount} page(s)`);
+
+								if (pageCount === 0) {
+									console.error('ERROR: PDF has 0 pages! Generation failed.');
+								}
+							} catch (verifyError) {
+								console.warn('Could not verify PDF page count:', verifyError);
+							}
+
+							// Get PDF page dimensions (A4 at 96 DPI)
+							// A4 = 210x297mm = 8.27x11.69 inches = 794x1123 pixels at 96 DPI
+							const pdfWidth = 794;  // A4 width in pixels at 96 DPI
+							const pdfHeight = 1123; // A4 height in pixels at 96 DPI
+
+							resolve({
+								pdfData,
+								pdfWidth,
+								pdfHeight,
+								coordinates  // Return coordinates from webview rendering
+							});
+						} catch (error) {
+							console.error('Error in webview:', error);
+							reject(error);
+						}
+					});
+
+					webview.addEventListener('crashed', () => {
+						clearTimeout(timeout);
+						reject(new Error('Webview crashed'));
+					});
+				});
+
+				return result;
+			} finally {
+				// Cleanup webview
+				console.log('Cleaning up webview...');
+				setTimeout(() => {
+					webviewContainer.remove();
+					console.log('Webview removed');
+				}, 100);
+			}
+
+		} catch (error) {
+			// Ensure cleanup on error
+			printEl?.remove();
+			comp?.unload();
+			leaf?.detach();
+			throw error;
+		}
+	}
+
+	/**
+	 * Generate random document ID
+	 */
+	private generateDocId(length: number): string {
+		const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+		let result = '';
+		for (let i = 0; i < length; i++) {
+			result += chars.charAt(Math.floor(Math.random() * chars.length));
+		}
+		return result;
+	}
+
+	/**
+	 * Save PDF to file
+	 */
+	async savePDF(pdfData: Buffer, filePath: string): Promise<void> {
+		const fs = require('fs').promises;
+		await fs.writeFile(filePath, pdfData);
+		console.log('PDF saved to:', filePath);
+	}
+}

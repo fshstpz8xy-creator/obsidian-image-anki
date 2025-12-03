@@ -1,0 +1,19 @@
+
+/* Add after line 19 (after body styles): */
+
+/* Remove all padding from markdown content container */
+.markdown-preview-view {
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+.markdown-preview-sizer {
+  padding: 0 !important;
+  margin: 0 !important;
+}
+
+/* Remove padding from markdown rendered content */
+.markdown-rendered {
+  padding: 0 !important;
+  margin: 0 !important;
+}

@@ -1,0 +1,10 @@
+{
+  "id": "obsidian-anki-image-occlusion",
+  "name": "Anki Image Occlusion",
+  "version": "1.3.0",
+  "minAppVersion": "0.15.0",
+  "description": "Export markdown notes with highlights to Anki as image occlusion cards for spaced repetition",
+  "author": "Eleanor Cross",
+  "authorUrl": "https://github.com/eleanorcross",
+  "isDesktopOnly": true
+}
